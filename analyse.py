@@ -21,7 +21,6 @@ import torch
 from tqdm import tqdm
 
 from constants import (
-    D_MODEL,
     EXPANSION_FACTOR,
     DECODER_INIT_NORM,
     NUM_GPUS,

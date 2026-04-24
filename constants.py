@@ -51,9 +51,8 @@ DATASET_DIR: Path = DATA_DIR / "datasets" / _dataset_slug
 # ---------------------------------------------------------------------------
 
 LAYER_INDEX: int = _env("MONO_LAYER_INDEX", 8, int)
-D_MODEL: int = _env("MONO_D_MODEL", 2048, int)
 SEQ_LEN: int = _env("MONO_SEQ_LEN", 512, int)
-NUM_EXTRACT_TOKENS: int = _env("MONO_NUM_EXTRACT_TOKENS", 20_000_000, int)
+NUM_EXTRACT_TOKENS: int = _env("MONO_NUM_EXTRACT_TOKENS", 10_000_000, int)
 
 ACTIVATIONS_DIR: Path = DATA_DIR / "activations" / _model_slug / f"layer{LAYER_INDEX}"
 
@@ -62,7 +61,6 @@ ACTIVATIONS_DIR: Path = DATA_DIR / "activations" / _model_slug / f"layer{LAYER_I
 # ---------------------------------------------------------------------------
 
 EXPANSION_FACTOR: int = _env("MONO_EXPANSION_FACTOR", 64, int)
-DICT_SIZE: int = D_MODEL * EXPANSION_FACTOR  # number of SAE features
 
 # ---------------------------------------------------------------------------
 # Training hyper-parameters  (paper defaults where applicable)
