@@ -69,7 +69,7 @@ EXPANSION_FACTOR: int = _env("MONO_EXPANSION_FACTOR", 64, int)
 NUM_TRAINING_STEPS: int = _env("MONO_NUM_TRAINING_STEPS", 100_000, int)
 BATCH_SIZE: int = _env("MONO_BATCH_SIZE", 4096, int)
 
-L1_COEFF: float = _env("MONO_L1_COEFF", 5.0, float)
+L1_COEFF: float = _env("MONO_L1_COEFF", 2.0, float)
 L1_WARMUP_FRAC: float = _env("MONO_L1_WARMUP_FRAC", 0.05, float)
 
 LR: float = _env("MONO_LR", 5e-5, float)
@@ -95,8 +95,8 @@ GPU_IDS: list[int] = list(range(NUM_GPUS))
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_DIR: Path = DATA_DIR / "sae_checkpoints"
-CHECKPOINT_EVERY: int = _env("MONO_CHECKPOINT_EVERY", 100, int)
-LOG_EVERY: int = _env("MONO_LOG_EVERY", 10, int)
+CHECKPOINT_EVERY: int = _env("MONO_CHECKPOINT_EVERY", 1000, int)
+LOG_EVERY: int = _env("MONO_LOG_EVERY", 5, int)
 
 # ---------------------------------------------------------------------------
 # Analysis

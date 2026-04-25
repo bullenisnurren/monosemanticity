@@ -28,8 +28,6 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from constants import (
-    D_MODEL,
-    DICT_SIZE,
     EXPANSION_FACTOR,
     BATCH_SIZE,
     NUM_TRAINING_STEPS,
@@ -192,11 +190,6 @@ def train():
     # ---- Activation loader ------------------------------------------------
     loader = ActivationLoader(ACTIVATIONS_DIR, BATCH_SIZE)
     d_model = loader.d
-
-    if d_model != D_MODEL:
-        print(f"[train] WARNING: constants D_MODEL={D_MODEL} but activations have "
-              f"d={d_model}. Using {d_model}.")
-
     dict_size = d_model * EXPANSION_FACTOR
     print(f"[train] d_model={d_model}, dict_size={dict_size} "
           f"({EXPANSION_FACTOR}x expansion)")
