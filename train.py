@@ -17,9 +17,9 @@ Key training details:
 """
 
 import json
-import math
 import warnings
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +30,7 @@ from tqdm import tqdm
 from constants import (
     EXPANSION_FACTOR,
     BATCH_SIZE,
+    BUFFER_SEQUENCES,
     NUM_TRAINING_STEPS,
     L1_COEFF,
     L1_WARMUP_FRAC,
@@ -41,7 +42,7 @@ from constants import (
     DECODER_INIT_NORM,
     NUM_GPUS,
     GPU_IDS,
-    ACTIVATIONS_DIR,
+    ACTIVATIONS_TRAIN_DIR,
     CHECKPOINT_DIR,
     CHECKPOINT_EVERY,
     LOG_EVERY,
@@ -127,9 +128,26 @@ class SparseAutoencoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ActivationLoader:
-    """Iterate over pre-extracted activations in shuffled order."""
+    """Iterate over pre-extracted activations with HDD-friendly access.
 
-    def __init__(self, activations_dir: Path, batch_size: int):
+    On-disk shape: ``(num_sequences, SEQ_LEN, d_model)``, raw / unnormalised.
+
+    Naive token-level shuffling triggers ``BATCH_SIZE`` random seeks per batch
+    into a multi-GB memmap, which is fatal on spinning disks.  Instead we keep
+    a RAM-resident buffer of ``buffer_sequences`` whole sequences (read with
+    sorted IDs so the disk head moves monotonically), shuffle the *tokens*
+    inside the buffer once, and drain it batch-by-batch.  The next buffer is
+    prefetched on a worker thread so I/O overlaps with GPU compute.
+
+    Quality argument: with ``buffer_sequences`` ≫ ``batch_size``, each batch
+    of ``batch_size`` tokens is sampled from ``buffer_sequences`` distinct
+    documents (so within-batch context correlation is negligible).  This is
+    indistinguishable in practice from full token-level shuffling for SAE
+    training, while avoiding the random-seek penalty.
+    """
+
+    def __init__(self, activations_dir: Path, batch_size: int,
+                 buffer_sequences: int):
         meta_path = activations_dir / "meta.json"
         if not meta_path.exists():
             raise FileNotFoundError(
@@ -139,32 +157,75 @@ class ActivationLoader:
             self.meta = json.load(f)
 
         act_path = activations_dir / self.meta["act_file"]
-        idx_path = activations_dir / self.meta["shuffle_file"]
-
-        self.activations = np.load(str(act_path), mmap_mode="r")  # (N, d)
-        self.shuffle_idx = np.load(str(idx_path))  # (N,)
-        self.N = self.activations.shape[0]
-        self.d = self.activations.shape[1]
+        # Memmapped (n_seqs, seq_len, d_model) — reads on slicing.
+        self._acts3d = np.load(str(act_path), mmap_mode="r")
+        self.n_seqs, self.seq_len, self.d = self._acts3d.shape
+        self.N = self.n_seqs * self.seq_len
         self.batch_size = batch_size
-        self.ptr = 0  # pointer into shuffle_idx
+        self.scale = float(self.meta["scale"])
 
+        if buffer_sequences > self.n_seqs:
+            buffer_sequences = self.n_seqs
+        if buffer_sequences * self.seq_len < batch_size:
+            raise ValueError(
+                f"buffer_sequences*seq_len ({buffer_sequences * self.seq_len}) "
+                f"< batch_size ({batch_size})"
+            )
+        self.buffer_sequences = buffer_sequences
+        self.buffer_tokens = buffer_sequences * self.seq_len
+
+        # Sequence-level permutation reused across buffer fills.
+        self._seq_perm = np.random.permutation(self.n_seqs).astype(np.int64)
+        self._seq_ptr = 0
+
+        # Background prefetch.
+        self._exec = ThreadPoolExecutor(max_workers=1,
+                                         thread_name_prefix="actloader")
+        self._buffer: np.ndarray | None = None
+        self._buffer_ptr = 0
+        self._next_future = self._exec.submit(self._make_buffer)
+
+    # ------------------------------------------------------------------
+    def _next_seq_block(self) -> np.ndarray:
+        """Return the next ``buffer_sequences`` sorted sequence indices."""
+        if self._seq_ptr + self.buffer_sequences > self.n_seqs:
+            self._seq_perm = np.random.permutation(self.n_seqs).astype(np.int64)
+            self._seq_ptr = 0
+        ids = self._seq_perm[self._seq_ptr:self._seq_ptr + self.buffer_sequences]
+        self._seq_ptr += self.buffer_sequences
+        # Sorting → monotonic disk head movement during the read pass.
+        return np.sort(ids)
+
+    def _make_buffer(self) -> np.ndarray:
+        """Read a fresh shuffled buffer (called on the background thread)."""
+        ids = self._next_seq_block()
+        buf = np.empty((self.buffer_sequences, self.seq_len, self.d),
+                        dtype=np.float32)
+        for i, sid in enumerate(ids):
+            # Each indexing is a contiguous (seq_len*d_model*4)-byte read.
+            buf[i] = self._acts3d[int(sid)]
+        flat = buf.reshape(-1, self.d)
+        # Token-level shuffle inside the loaded buffer.
+        np.random.shuffle(flat)
+        # Apply global normalisation up-front so get_batch is allocation-free.
+        flat *= self.scale
+        return flat
+
+    # ------------------------------------------------------------------
     def get_batch(self, device: torch.device) -> torch.Tensor:
-        """Return a (batch_size, d) float32 tensor on *device*."""
-        start = self.ptr
+        """Return a normalised ``(batch_size, d)`` float32 tensor on *device*."""
+        if (self._buffer is None
+                or self._buffer_ptr + self.batch_size > len(self._buffer)):
+            self._buffer = self._next_future.result()
+            self._buffer_ptr = 0
+            self._next_future = self._exec.submit(self._make_buffer)
+        start = self._buffer_ptr
         end = start + self.batch_size
-
-        if end > self.N:
-            # Wrap around: reshuffle and restart.
-            self.shuffle_idx = np.random.permutation(self.N).astype(np.int64)
-            self.ptr = 0
-            start = 0
-            end = self.batch_size
-
-        indices = self.shuffle_idx[start:end]
-        self.ptr = end
-
-        batch_np = self.activations[indices]  # copy from memmap
-        return torch.from_numpy(np.array(batch_np)).float().to(device)
+        self._buffer_ptr = end
+        # from_numpy shares memory; .to(device) copies to GPU, after which the
+        # buffer slice can be safely overwritten on the next refill.
+        return torch.from_numpy(self._buffer[start:end]).to(device,
+                                                              non_blocking=True)
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +249,13 @@ def train():
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     # ---- Activation loader ------------------------------------------------
-    loader = ActivationLoader(ACTIVATIONS_DIR, BATCH_SIZE)
+    loader = ActivationLoader(ACTIVATIONS_TRAIN_DIR, BATCH_SIZE, BUFFER_SEQUENCES)
     d_model = loader.d
     dict_size = d_model * EXPANSION_FACTOR
+    print(f"[train] Activation scale = {loader.scale:.6f}")
+    print(f"[train] Loader buffer: {loader.buffer_sequences:,} sequences "
+          f"({loader.buffer_tokens:,} tokens, "
+          f"{loader.buffer_sequences * loader.seq_len * loader.d * 4 / 1e9:.2f} GB)")
     print(f"[train] d_model={d_model}, dict_size={dict_size} "
           f"({EXPANSION_FACTOR}x expansion)")
     print(f"[train] {loader.N:,} activation vectors, batch_size={BATCH_SIZE}")
@@ -284,14 +349,16 @@ def train():
 
         # ---- Checkpoint ---------------------------------------------------
         if step % CHECKPOINT_EVERY == 0 or step == NUM_TRAINING_STEPS:
-            _save_checkpoint(sae, optimiser, scheduler, step, d_model, dict_size)
+            _save_checkpoint(sae, optimiser, scheduler, step,
+                             d_model, dict_size, loader.scale)
 
     elapsed = time.time() - t0
     print(f"[train] Finished {NUM_TRAINING_STEPS} steps in {elapsed:.1f}s "
           f"({elapsed / NUM_TRAINING_STEPS:.3f}s/step)")
 
 
-def _save_checkpoint(sae, optimiser, scheduler, step, d_model, dict_size):
+def _save_checkpoint(sae, optimiser, scheduler, step,
+                     d_model, dict_size, activation_scale):
     path = CHECKPOINT_DIR / f"sae_step_{step:06d}.pt"
     torch.save(
         {
@@ -299,6 +366,7 @@ def _save_checkpoint(sae, optimiser, scheduler, step, d_model, dict_size):
             "d_model": d_model,
             "dict_size": dict_size,
             "expansion_factor": EXPANSION_FACTOR,
+            "activation_scale": float(activation_scale),
             "model_state_dict": sae.state_dict(),
             "optimiser_state_dict": optimiser.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),

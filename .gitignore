@@ -1,4 +1,5 @@
 # Artifacts
+data
 data/*
 !data/paper.html
 

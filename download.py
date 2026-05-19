@@ -16,7 +16,6 @@ from pathlib import Path
 
 from huggingface_hub import snapshot_download
 from datasets import load_dataset
-from transformers import AutoTokenizer
 from tqdm import tqdm
 
 from constants import (
@@ -26,7 +25,8 @@ from constants import (
     DATASET_DIR,
     DATASET_SPLIT,
     DATASET_TEXT_FIELD,
-    NUM_EXTRACT_TOKENS,
+    NUM_EXTRACT_TOKENS_TRAIN,
+    NUM_EXTRACT_TOKENS_TEST,
     SEQ_LEN,
 )
 
@@ -61,7 +61,7 @@ def download_model() -> Path:
 # Dataset download
 # ---------------------------------------------------------------------------
 
-def _estimate_examples_needed(tokenizer, target_tokens: int, seq_len: int) -> int:
+def _estimate_examples_needed(target_tokens: int, seq_len: int) -> int:
     """Rough estimate of how many dataset examples we need.
 
     We assume each example yields on average ``seq_len`` usable tokens after
@@ -82,12 +82,13 @@ def download_dataset() -> Path:
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
     data_path.mkdir(parents=True, exist_ok=True)
 
-    # Estimate how many examples we need.
-    print(f"[download] Loading tokenizer for {MODEL_NAME} ...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    n_examples = _estimate_examples_needed(tokenizer, NUM_EXTRACT_TOKENS, SEQ_LEN)
-    print(f"[download] Target: {NUM_EXTRACT_TOKENS:,} tokens  ->  "
-          f"fetching ~{n_examples:,} examples (safety margin 1.5x)")
+    # Estimate how many examples we need.  We fetch enough text to cover the
+    # train + test extraction budget; extract.py will then split the stream.
+    target_tokens = NUM_EXTRACT_TOKENS_TRAIN + NUM_EXTRACT_TOKENS_TEST
+    n_examples = _estimate_examples_needed(target_tokens, SEQ_LEN)
+    print(f"[download] Target: {target_tokens:,} tokens "
+          f"(train={NUM_EXTRACT_TOKENS_TRAIN:,}, test={NUM_EXTRACT_TOKENS_TEST:,}) "
+          f"->  fetching ~{n_examples:,} examples (safety margin 1.5x)")
 
     # Stream the dataset so we only download what we need.
     print(f"[download] Streaming dataset {DATASET_NAME} (split={DATASET_SPLIT}) ...")

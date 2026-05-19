@@ -1,260 +1,422 @@
 #!/usr/bin/env python3
 """
-Analyse a trained SAE checkpoint.
+Build a human-readable HTML report from pre-computed SAE features.
 
-Computes:
-  - L0  (mean active features per token)
-  - Explained variance
-  - Dead / alive feature counts
-  - Per-feature activation frequency & max activation
-  - Top-k activating token indices for a sample of features
-  - Decoder cosine-similarity neighborhoods for a sample of features
+Pipeline position:    train.py -> infer.py -> analyse.py
 
-Results are saved to ./data/analysis/ as a JSON report and printed to stdout.
+This script does **no** GPU work and never invokes the SAE or the language
+model under study.  It only:
+
+  1. Loads the features memmap produced by infer.py (chunk-wise to bound RAM).
+  2. Identifies dead features and randomly samples a configurable number of
+     non-dead ones (ANALYSIS_NUM_FEATURES).
+  3. For each sampled feature, finds the top-k sequences (where the per-token
+     max activation is highest).
+  4. Asks an OpenAI-compatible LLM to describe what those top-k examples have
+     in common.
+  5. Renders an HTML report with metadata, descriptions, and per-token green
+     highlighting proportional to the feature's activation on each token.
+
+Output: ANALYSIS_DIR / "report.html"
 """
 
+import html as _html
 import json
 from pathlib import Path
+from urllib import request as urlrequest
+from urllib.error import URLError
 
 import numpy as np
-import torch
 from tqdm import tqdm
 
 from constants import (
-    EXPANSION_FACTOR,
-    DECODER_INIT_NORM,
-    NUM_GPUS,
-    GPU_IDS,
-    ACTIVATIONS_DIR,
-    CHECKPOINT_DIR,
+    ACTIVATIONS_TRAIN_DIR,
     ANALYSIS_DIR,
-    ANALYSIS_NUM_TOKENS,
-    ANALYSIS_SAMPLE_FEATURES,
+    ANALYSIS_NUM_FEATURES,
+    ANALYSIS_SEED,
     ANALYSIS_TOP_K,
+    DATASET_NAME,
+    FEATURES_DIR,
+    LLM_API_BASE_URL,
+    LLM_API_KEY,
+    LLM_API_MODEL,
+    LLM_API_TIMEOUT,
+    LLM_EXAMPLE_CHARS,
+    LLM_NUM_EXAMPLES,
+    MODEL_NAME,
 )
-from train import SparseAutoencoder
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Loading
 # ---------------------------------------------------------------------------
 
-def _find_latest_checkpoint() -> Path:
-    """Return the checkpoint with the highest step number."""
-    ckpts = sorted(CHECKPOINT_DIR.glob("sae_step_*.pt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints found in {CHECKPOINT_DIR}")
-    return ckpts[-1]
-
-
-def _load_sae(ckpt_path: Path, device: torch.device) -> SparseAutoencoder:
-    """Load an SAE from a checkpoint file."""
-    ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-    d_model = ckpt["d_model"]
-    dict_size = ckpt["dict_size"]
-    sae = SparseAutoencoder(d_model, dict_size, DECODER_INIT_NORM)
-    sae.load_state_dict(ckpt["model_state_dict"])
-    sae.to(device).eval()
-    return sae
-
-
-def _load_activations() -> np.ndarray:
-    """Load the pre-extracted activations (memmap)."""
-    meta_path = ACTIVATIONS_DIR / "meta.json"
+def _load_features_meta() -> dict:
+    meta_path = FEATURES_DIR / "meta.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"No features meta.json at {meta_path}. Run infer.py first."
+        )
     with open(meta_path) as f:
-        meta = json.load(f)
-    act_path = ACTIVATIONS_DIR / meta["act_file"]
-    return np.load(str(act_path), mmap_mode="r")
+        return json.load(f)
+
+
+def _load_sequences(path: Path) -> list[dict]:
+    """Read sequences.jsonl lazily into a list of dicts."""
+    out = []
+    with open(path) as f:
+        for line in f:
+            out.append(json.loads(line))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Post-training normalisation
+# Top-k discovery (uses pre-computed side arrays + per-feature reads)
 # ---------------------------------------------------------------------------
 
-def normalise_decoder(sae: SparseAutoencoder):
-    """Rescale weights so decoder columns have unit L2 norm.
+def _find_top_k(features_mm: np.memmap,
+                sampled_ids: np.ndarray,
+                max_per_seq: np.ndarray,
+                argmax_per_seq: np.ndarray,
+                top_k: int) -> dict[int, list[dict]]:
+    """For each sampled feature, return its ``top_k`` sequences (sorted
+    descending by peak activation), each carrying the full per-token
+    activation row used for rendering.
 
-    After this transformation the model is mathematically equivalent, but
-    feature activations are now in "true" units and decoder vectors are
-    unit directions.
-
-        W_enc'[i] = W_enc[i]  * ||W_dec[:, i]||
-        b_enc'[i] = b_enc[i]  * ||W_dec[:, i]||
-        W_dec'[:, i] = W_dec[:, i] / ||W_dec[:, i]||
-        b_dec  unchanged
+    The features memmap is feature-major ``(F, N, S)``, so ``features_mm[fid]``
+    is a 2-MB contiguous read.  We use ``max_per_seq`` / ``argmax_per_seq``
+    (precomputed in infer.py) to pick the top-k sequences without touching
+    the big tensor, then fetch the per-token rows for only those sequences.
     """
-    with torch.no_grad():
-        norms = sae.W_dec.norm(dim=0, keepdim=True).clamp(min=1e-8)  # (1, F)
-        sae.W_enc.mul_(norms.T)       # (F, d) * (F, 1)
-        sae.b_enc.mul_(norms.squeeze(0))  # (F,)
-        sae.W_dec.div_(norms)          # (d, F) / (1, F)
+    out: dict[int, list[dict]] = {}
+    for fid in tqdm(sampled_ids, desc="top-k"):
+        fid_int = int(fid)
+        col = max_per_seq[:, fid_int].astype(np.float32)         # (N,)
+        # Indices of sequences with non-zero peak, sorted descending.
+        nonzero = np.where(col > 0)[0]
+        if nonzero.size == 0:
+            out[fid_int] = []
+            continue
+        k = min(top_k, nonzero.size)
+        # argpartition gives the unsorted top-k; we then sort just those.
+        cand = nonzero[np.argpartition(-col[nonzero], k - 1)[:k]]
+        cand = cand[np.argsort(-col[cand])]
+        # Single contiguous 2-MB read per feature.
+        feat_rows = np.asarray(features_mm[fid_int], dtype=np.float32)  # (N, S)
+        examples = []
+        for seq_idx in cand:
+            examples.append({
+                "val": float(col[seq_idx]),
+                "seq_idx": int(seq_idx),
+                "peak_idx": int(argmax_per_seq[seq_idx, fid_int]),
+                "row": feat_rows[seq_idx].copy(),
+            })
+        out[fid_int] = examples
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Analysis
+# LLM-based feature description
+# ---------------------------------------------------------------------------
+
+def _build_prompt(top_examples: list[tuple[list[str], int]]) -> str:
+    """Build a description prompt from a feature's top examples.
+
+    *top_examples* is a list of ``(token_strings, peak_token_idx)`` pairs.
+    Each example is truncated to a window around the peak token.
+    """
+    lines = [
+        "You are an interpretability researcher.  Below are short text "
+        "excerpts that all strongly activate the SAME feature in a sparse "
+        "autoencoder trained on a transformer language model.  The token "
+        "where the feature fires most strongly is wrapped in <<>>.",
+        "",
+        "Identify what concept, pattern, or behaviour the feature is "
+        "detecting.  Reply with ONE concise sentence (max ~20 words), "
+        "no preamble, no quotes.",
+        "",
+    ]
+    for i, (tokens, peak_idx) in enumerate(top_examples, 1):
+        excerpt = _excerpt_around_peak(tokens, peak_idx, LLM_EXAMPLE_CHARS)
+        lines.append(f"Example {i}: {excerpt}")
+    return "\n".join(lines)
+
+
+def _excerpt_around_peak(tokens: list[str], peak_idx: int, max_chars: int) -> str:
+    """Return a string with `<<peak_token>>` highlighted, capped to ``max_chars``."""
+    parts = list(tokens)
+    if 0 <= peak_idx < len(parts):
+        parts[peak_idx] = f"<<{parts[peak_idx]}>>"
+    full = "".join(parts)
+    if len(full) <= max_chars:
+        return full
+    # Center window on the peak token.
+    pre_chars = sum(len(t) for t in parts[:peak_idx])
+    half = max_chars // 2
+    start = max(0, pre_chars - half)
+    end = min(len(full), pre_chars + half)
+    snippet = full[start:end]
+    if start > 0:
+        snippet = "..." + snippet
+    if end < len(full):
+        snippet = snippet + "..."
+    return snippet
+
+
+def _call_llm(prompt: str) -> str | None:
+    """Call an OpenAI-compatible /v1/chat/completions endpoint via stdlib."""
+    url = LLM_API_BASE_URL.rstrip("/") + "/v1/chat/completions"
+    payload = {
+        "model": LLM_API_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+        "max_tokens": 80,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LLM_API_KEY}",
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=LLM_API_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"].strip()
+    except (URLError, TimeoutError, KeyError, ValueError) as exc:
+        print(f"[analyse] LLM call failed: {exc!r}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# HTML rendering
+# ---------------------------------------------------------------------------
+
+_HTML_TEMPLATE_HEAD = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SAE Feature Report - {model}</title>
+<style>
+  :root {{ --accent: #2a9d8f; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 960px; margin: 2em auto; padding: 0 1em; color: #222; }}
+  h1 {{ border-bottom: 2px solid var(--accent); padding-bottom: 0.25em; }}
+  h2 {{ margin-top: 2em; border-bottom: 1px solid #ddd; padding-bottom: 0.2em; }}
+  table.meta td {{ padding: 2px 14px 2px 0; vertical-align: top; }}
+  table.meta td:first-child {{ color: #666; white-space: nowrap; }}
+  .feature {{ margin: 2em 0; padding: 1em 1.2em; border: 1px solid #e3e3e3;
+              border-radius: 6px; background: #fafafa; }}
+  .feature h3 {{ margin: 0 0 0.3em 0; }}
+  .feature .desc {{ font-style: italic; color: #444; margin-bottom: 0.7em; }}
+  .feature .stats {{ font-size: 0.85em; color: #666; margin-bottom: 0.7em; }}
+  .examples {{ display: flex; flex-direction: column; gap: 6px; }}
+  .example {{ font-family: ui-monospace, "SF Mono", Menlo, monospace;
+              font-size: 12px; line-height: 1.45;
+              padding: 6px 8px; background: #fff;
+              border: 1px solid #eee; border-radius: 4px;
+              white-space: pre-wrap; word-break: break-word; }}
+  .example .max-act {{ float: right; color: #999; font-size: 11px; }}
+  .tok {{ padding: 0 1px; border-radius: 2px; }}
+</style>
+</head>
+<body>
+<h1>SAE Feature Report</h1>
+"""
+
+_HTML_TEMPLATE_FOOT = """</body>\n</html>\n"""
+
+
+def _green_bg(intensity: float) -> str:
+    """Return a `background-color:` CSS fragment.  *intensity* in [0, 1]."""
+    if intensity <= 0:
+        return ""
+    intensity = max(0.0, min(1.0, intensity))
+    # A lightish-to-medium green.  Alpha encodes intensity.
+    return f"background-color: rgba(46, 204, 113, {intensity:.3f});"
+
+
+def _render_example(tokens: list[str], values: np.ndarray, vmax: float) -> str:
+    """Render one example as a sequence of <span class=tok> elements."""
+    parts = []
+    if vmax <= 0:
+        vmax = 1.0
+    for tok, v in zip(tokens, values):
+        intensity = float(v) / vmax if v > 0 else 0.0
+        style = _green_bg(intensity)
+        text = _html.escape(tok).replace("\n", "↵\n")
+        if style:
+            parts.append(f'<span class="tok" style="{style}">{text}</span>')
+        else:
+            parts.append(f'<span class="tok">{text}</span>')
+    return "".join(parts)
+
+
+def _render_meta_table(rows: list[tuple[str, str]]) -> str:
+    out = ['<table class="meta">']
+    for k, v in rows:
+        out.append(f"<tr><td>{_html.escape(k)}</td>"
+                   f"<td>{_html.escape(str(v))}</td></tr>")
+    out.append("</table>")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------------
 
 def analyse():
     ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(f"cuda:{GPU_IDS[0]}" if torch.cuda.is_available()
-                          else "cpu")
+    # ---- Load features metadata + memmap ---------------------------------
+    feat_meta = _load_features_meta()
+    features_path = FEATURES_DIR / feat_meta["features_file"]
+    features = np.load(str(features_path), mmap_mode="r")  # (F, N, S)
+    layout = feat_meta.get("features_layout", "feature_major")
+    if layout != "feature_major":
+        raise RuntimeError(
+            f"Unsupported features_layout {layout!r}.  Re-run infer.py."
+        )
+    dict_size, n_seqs, seq_len = features.shape
 
-    # ---- Load checkpoint & activations ------------------------------------
-    ckpt_path = _find_latest_checkpoint()
-    print(f"[analyse] Loading checkpoint: {ckpt_path.name}")
-    sae = _load_sae(ckpt_path, device)
+    sequences_path = FEATURES_DIR / feat_meta["sequences_file"]
+    sequences = _load_sequences(sequences_path)
+    if len(sequences) != n_seqs:
+        print(f"[analyse] WARNING: sequences.jsonl has {len(sequences)} entries "
+              f"but features have {n_seqs} sequences.")
 
-    print("[analyse] Normalising decoder to unit-norm columns ...")
-    normalise_decoder(sae)
-
-    acts_mmap = _load_activations()
-    N_total = acts_mmap.shape[0]
-    d_model = acts_mmap.shape[1]
-    dict_size = sae.dict_size
-    n_tokens = min(ANALYSIS_NUM_TOKENS, N_total)
-    print(f"[analyse] Analysing {n_tokens:,} / {N_total:,} tokens  "
-          f"(d={d_model}, F={dict_size})")
-
-    # ---- Accumulate statistics --------------------------------------------
-    batch_size = 4096
-    n_batches = (n_tokens + batch_size - 1) // batch_size
-
-    # Running accumulators.
-    feature_fire_count = torch.zeros(dict_size, device=device)   # how often each feature > 0
-    feature_max_act = torch.zeros(dict_size, device=device)      # max activation per feature
-    total_l0 = 0.0
-    total_mse = 0.0
-    total_var = 0.0
-    tokens_seen = 0
-
-    # For top-k tracking on a sample of features.
-    sample_feature_ids = np.linspace(0, dict_size - 1,
-                                     min(ANALYSIS_SAMPLE_FEATURES, dict_size),
-                                     dtype=int)
-    sample_feature_ids = np.unique(sample_feature_ids)
-    # Store (activation_value, global_token_index) per sampled feature.
-    topk_heap: dict[int, list[tuple[float, int]]] = {
-        int(fid): [] for fid in sample_feature_ids
-    }
-
-    global_idx = 0
-    for batch_i in tqdm(range(n_batches), desc="analysing"):
-        start = batch_i * batch_size
-        end = min(start + batch_size, n_tokens)
-        x_np = acts_mmap[start:end]
-        x = torch.from_numpy(np.array(x_np)).float().to(device)
-
-        with torch.no_grad():
-            f = sae.encode(x)
-            x_hat = sae.decode(f)
-
-        # MSE & variance components.
-        total_mse += (x - x_hat).pow(2).sum().item()
-        total_var += (x - x.mean(dim=0, keepdim=True)).pow(2).sum().item()
-
-        # L0.
-        active_mask = f > 0
-        total_l0 += active_mask.float().sum(dim=-1).sum().item()  # sum across batch
-
-        # Per-feature stats.
-        feature_fire_count += active_mask.float().sum(dim=0)
-        feature_max_act = torch.max(feature_max_act, f.max(dim=0).values)
-
-        tokens_seen += (end - start)
-
-        # Top-k for sampled features.
-        f_sample = f[:, sample_feature_ids].cpu().numpy()  # (B, n_sample)
-        for j, fid in enumerate(sample_feature_ids):
-            fid = int(fid)
-            col = f_sample[:, j]
-            for local_i in range(col.shape[0]):
-                val = float(col[local_i])
-                if val <= 0:
-                    continue
-                tok_idx = global_idx + local_i
-                heap = topk_heap[fid]
-                if len(heap) < ANALYSIS_TOP_K:
-                    heap.append((val, tok_idx))
-                elif val > heap[-1][0]:
-                    heap[-1] = (val, tok_idx)
-                # Keep sorted descending.
-                heap.sort(key=lambda t: -t[0])
-
-        global_idx += (end - start)
-
-    # ---- Aggregate --------------------------------------------------------
-    mean_l0 = total_l0 / tokens_seen
-    explained_var = 1.0 - total_mse / max(total_var, 1e-12)
-
-    feature_freq = (feature_fire_count / tokens_seen).cpu().numpy()
-    dead_mask = feature_fire_count == 0
-    n_dead = int(dead_mask.sum().item())
+    fire_count = np.load(str(FEATURES_DIR / feat_meta["fire_count_file"]))
+    max_per_seq = np.load(str(FEATURES_DIR / feat_meta["max_per_seq_file"]),
+                           mmap_mode="r")
+    argmax_per_seq = np.load(str(FEATURES_DIR / feat_meta["argmax_per_seq_file"]),
+                              mmap_mode="r")
+    n_dead = int((fire_count == 0).sum())
     n_alive = dict_size - n_dead
-    pct_dead = 100.0 * n_dead / dict_size
+    print(f"[analyse] Features: {dict_size}, alive: {n_alive}, dead: {n_dead}")
 
-    feature_max_act_np = feature_max_act.cpu().numpy()
+    # ---- Sample non-dead features ----------------------------------------
+    rng = np.random.default_rng(ANALYSIS_SEED)
+    alive_ids = np.where(fire_count > 0)[0]
+    if alive_ids.size == 0:
+        raise RuntimeError("No alive features in the test set — nothing to analyse.")
+    n_sample = min(ANALYSIS_NUM_FEATURES, alive_ids.size)
+    sampled_ids = np.sort(rng.choice(alive_ids, size=n_sample, replace=False))
+    print(f"[analyse] Sampling {n_sample} non-dead features for the report.")
 
-    # ---- Decoder cosine similarity for sampled features -------------------
-    print("[analyse] Computing decoder neighborhoods ...")
-    W_dec_normed = sae.W_dec.detach()  # already unit-norm after normalise_decoder
-    neighborhoods: dict[str, list[dict]] = {}
-    for fid in sample_feature_ids:
-        fid = int(fid)
-        col = W_dec_normed[:, fid]  # (d,)
-        cos = (W_dec_normed.T @ col)  # (F,)
-        cos[fid] = -2.0  # exclude self
-        topk_vals, topk_ids = cos.topk(5)
-        neighbors = [
-            {"feature": int(topk_ids[k]), "cosine": float(topk_vals[k])}
-            for k in range(5)
+    # ---- Find top-k sequences for each sampled feature -------------------
+    top = _find_top_k(features, sampled_ids,
+                      max_per_seq, argmax_per_seq,
+                      ANALYSIS_TOP_K)
+
+    # ---- LLM descriptions -------------------------------------------------
+    descriptions: dict[int, str] = {}
+    print(f"[analyse] Requesting LLM descriptions from {LLM_API_BASE_URL} "
+          f"(model={LLM_API_MODEL}) ...")
+    for fid in tqdm(sampled_ids, desc="describe"):
+        fid_int = int(fid)
+        examples = top[fid_int][:LLM_NUM_EXAMPLES]
+        if not examples:
+            descriptions[fid_int] = "(no activations)"
+            continue
+        ex_inputs = [
+            (sequences[ex["seq_idx"]]["tokens"], ex["peak_idx"])
+            for ex in examples
         ]
-        neighborhoods[str(fid)] = neighbors
+        prompt = _build_prompt(ex_inputs)
+        desc = _call_llm(prompt)
+        descriptions[fid_int] = desc or "(LLM call failed)"
 
-    # ---- Build report -----------------------------------------------------
-    report = {
-        "checkpoint": ckpt_path.name,
-        "tokens_analysed": tokens_seen,
-        "d_model": d_model,
-        "dict_size": dict_size,
-        "mean_l0": round(mean_l0, 2),
-        "explained_variance": round(explained_var, 6),
-        "dead_features": n_dead,
-        "alive_features": n_alive,
-        "pct_dead": round(pct_dead, 2),
-        "feature_freq_percentiles": {
-            p: round(float(np.percentile(feature_freq, p)), 8)
-            for p in [0, 10, 25, 50, 75, 90, 99, 100]
-        },
-        "feature_max_act_percentiles": {
-            p: round(float(np.percentile(feature_max_act_np, p)), 4)
-            for p in [0, 10, 25, 50, 75, 90, 99, 100]
-        },
-        "sample_feature_topk": {
-            str(fid): [
-                {"activation": round(v, 4), "token_index": idx}
-                for v, idx in topk_heap[fid]
-            ]
-            for fid in [int(x) for x in sample_feature_ids]
-        },
-        "decoder_neighborhoods": neighborhoods,
-    }
+    # ---- Render report ----------------------------------------------------
+    report_path = ANALYSIS_DIR / "report.html"
+    html_parts: list[str] = []
+    html_parts.append(_HTML_TEMPLATE_HEAD.format(
+        model=_html.escape(MODEL_NAME)))
 
-    # ---- Save & print -----------------------------------------------------
-    report_path = ANALYSIS_DIR / "report.json"
-    report_path.write_text(json.dumps(report, indent=2))
-    print(f"\n[analyse] Report saved to {report_path}")
+    # ---- Metadata sections ----------------------------------------------
+    test_meta = feat_meta.get("test_split_meta", {})
+    train_cfg = feat_meta.get("training_config", {})
+    train_meta_path = ACTIVATIONS_TRAIN_DIR / "meta.json"
+    train_meta = json.loads(train_meta_path.read_text()) if train_meta_path.exists() else {}
 
-    print("\n===== SAE Analysis Summary =====")
-    print(f"  Checkpoint        : {ckpt_path.name}")
-    print(f"  Tokens analysed   : {tokens_seen:,}")
-    print(f"  d_model           : {d_model}")
-    print(f"  dict_size         : {dict_size:,}")
-    print(f"  Mean L0           : {mean_l0:.2f}")
-    print(f"  Explained variance: {explained_var:.4f}")
-    print(f"  Dead features     : {n_dead:,} / {dict_size:,} ({pct_dead:.1f}%)")
-    print(f"  Alive features    : {n_alive:,}")
-    print("================================\n")
+    html_parts.append("<h2>Experiment metadata</h2>")
+    html_parts.append(_render_meta_table([
+        ("Model", MODEL_NAME),
+        ("d_model", feat_meta.get("d_model", "?")),
+        ("Layer index", test_meta.get("layer_index", "?")),
+        ("Dataset", DATASET_NAME),
+        ("Train tokens", f"{train_meta.get('num_tokens', '?'):,}"
+                          if isinstance(train_meta.get("num_tokens"), int)
+                          else str(train_meta.get("num_tokens", "?"))),
+        ("Test tokens", f"{test_meta.get('num_tokens', '?'):,}"
+                         if isinstance(test_meta.get("num_tokens"), int)
+                         else str(test_meta.get("num_tokens", "?"))),
+        ("Sequence length", test_meta.get("seq_len", seq_len)),
+        ("Activation scale", f"{feat_meta.get('activation_scale', float('nan')):.6f}"),
+    ]))
+
+    html_parts.append("<h2>SAE metadata</h2>")
+    html_parts.append(_render_meta_table([
+        ("Checkpoint", feat_meta.get("checkpoint", "?")),
+        ("Step", feat_meta.get("step", "?")),
+        ("Expansion factor", feat_meta.get("expansion_factor", "?")),
+        ("Dictionary size", dict_size),
+        ("Alive features (test)", f"{n_alive:,}"),
+        ("Dead features (test)", f"{n_dead:,} ({100 * n_dead / dict_size:.2f}%)"),
+        ("Batch size", train_cfg.get("batch_size", "?")),
+        ("L1 coefficient", train_cfg.get("l1_coeff", "?")),
+        ("Learning rate", train_cfg.get("lr", "?")),
+        ("Training steps", train_cfg.get("num_training_steps", "?")),
+        ("Decoder init norm", train_cfg.get("decoder_init_norm", "?")),
+    ]))
+
+    # ---- Per-feature blocks ----------------------------------------------
+    html_parts.append("<h2>Sampled features</h2>")
+    html_parts.append("<p>Each feature shows a natural-language description "
+                       "(generated by an LLM from the top examples) followed "
+                       "by the top-k test sequences in which the feature "
+                       "fires most strongly.  The greener a token's "
+                       "background, the higher the feature's activation on "
+                       "that token (normalised within the feature).</p>")
+
+    for fid in sampled_ids:
+        fid_int = int(fid)
+        examples = top[fid_int]
+        desc = descriptions[fid_int]
+        peak = examples[0]["val"] if examples else 0.0
+        html_parts.append('<div class="feature">')
+        html_parts.append(f'<h3>Feature #{fid_int}</h3>')
+        html_parts.append(f'<p class="desc">{_html.escape(desc)}</p>')
+        html_parts.append(
+            f'<p class="stats">Top examples: {len(examples)}; '
+            f'peak activation: {peak:.3f}; '
+            f'fires on {int(fire_count[fid_int]):,} test tokens '
+            f'({100 * int(fire_count[fid_int]) / (n_seqs * seq_len):.4f}%)</p>'
+        )
+        html_parts.append('<div class="examples">')
+
+        vmax = peak if peak > 0 else 1.0
+
+        for ex in examples:
+            tokens = sequences[ex["seq_idx"]]["tokens"]
+            rendered = _render_example(tokens, ex["row"], vmax)
+            html_parts.append(
+                '<div class="example">'
+                f'<span class="max-act">max={ex["val"]:.3f} '
+                f'(seq #{ex["seq_idx"]}, tok #{ex["peak_idx"]})</span>'
+                f'{rendered}</div>'
+            )
+
+        html_parts.append('</div></div>')
+
+    html_parts.append(_HTML_TEMPLATE_FOOT)
+    report_path.write_text("".join(html_parts))
+
+    print(f"[analyse] Report saved to {report_path}")
+    print(f"[analyse] {n_sample} features described, "
+          f"{sum(1 for d in descriptions.values() if d.startswith('('))} failed.")
 
 
 # ---------------------------------------------------------------------------
