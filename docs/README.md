@@ -1,17 +1,10 @@
 # Documentation
 
-Reference docs for the SAE pipeline. Start here:
+- **[pipeline.md](pipeline.md)** — what each script does, its inputs and
+  outputs, and how to run it.
+- **[data-formats.md](data-formats.md)** — on-disk file specs (shapes,
+  dtypes, JSON schemas) for every artefact the pipeline produces.
 
-- **[architecture.md](architecture.md)** — System design, data flow, and the
-  *why* behind the file layouts.
-- **[pipeline.md](pipeline.md)** — Per-script walkthroughs (what each script
-  does, its inputs and outputs, how to test it in isolation).
-- **[data-formats.md](data-formats.md)** — Authoritative on-disk file specs
-  (shapes, dtypes, JSON schemas) for every artefact the pipeline produces.
-- **[configuration.md](configuration.md)** — Full reference for the `MONO_*`
-  environment variables / `constants.py` tunables.
-- **[performance.md](performance.md)** — Bottleneck analysis, per-stage time
-  budgets, and tuning recipes for different hardware constraints.
-
-For top-level usage, see [`../README.md`](../README.md). For agent-facing
-guidance and project invariants, see [`../AGENTS.md`](../AGENTS.md).
+For top-level usage and the full list of config knobs, see
+[`../README.md`](../README.md). For agent-facing guidance, see
+[`../AGENTS.md`](../AGENTS.md).
