@@ -99,7 +99,7 @@ DECODER_INIT_NORM: float = _env("MONO_DECODER_INIT_NORM", 0.1, float)
 # Hardware
 # ---------------------------------------------------------------------------
 
-NUM_GPUS: int = _env("MONO_NUM_GPUS", 2, int)
+NUM_GPUS: int = _env("MONO_NUM_GPUS", 1, int)
 # When NUM_GPUS=1 we use cuda:0 only; when >1 we use cuda:0 .. cuda:{NUM_GPUS-1}.
 GPU_IDS: list[int] = list(range(NUM_GPUS))
 
