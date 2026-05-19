@@ -106,6 +106,9 @@ def infer():
     with torch.no_grad():
         dec_norms = sae.W_dec.norm(dim=0).contiguous()              # (F,)
         b_enc_eff = (sae.b_enc - sae.b_dec @ sae.W_enc.T).contiguous()  # (F,)
+        # Unit-norm decoder directions, laid out (F, d) so per-feature
+        # reads in analyse.py are contiguous.
+        W_dec_unit_fd = (sae.W_dec / dec_norms.clamp(min=1e-8)).T.contiguous()  # (F, d) fp32
 
     # Cast SAE to bf16 for inference.  bf16 matmul on Ampere is fast and the
     # precision is more than enough for interpretability work.
@@ -202,6 +205,8 @@ def infer():
     np.save(str(FEATURES_DIR / "fire_count.npy"), fire_count)
     np.save(str(FEATURES_DIR / "max_per_seq.npy"), max_per_seq)
     np.save(str(FEATURES_DIR / "argmax_per_seq.npy"), argmax_per_seq)
+    np.save(str(FEATURES_DIR / "decoder_directions.npy"),
+            W_dec_unit_fd.to(torch.float16).cpu().numpy())
 
     for fname in ("token_ids.npy", "sequences.jsonl"):
         src = ACTIVATIONS_TEST_DIR / fname
@@ -228,6 +233,7 @@ def infer():
         "fire_count_file": "fire_count.npy",
         "max_per_seq_file": "max_per_seq.npy",
         "argmax_per_seq_file": "argmax_per_seq.npy",
+        "decoder_directions_file": "decoder_directions.npy",
         "token_ids_file": "token_ids.npy",
         "sequences_file": "sequences.jsonl",
         "test_split_meta": test_meta,

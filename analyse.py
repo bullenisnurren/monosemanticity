@@ -32,6 +32,10 @@ from tqdm import tqdm
 from constants import (
     ACTIVATIONS_TRAIN_DIR,
     ANALYSIS_DIR,
+    ANALYSIS_DIVERSE_SELECTION,
+    ANALYSIS_MAX_FIRE_FRAC,
+    ANALYSIS_MIN_DISTINCT_SEQUENCES,
+    ANALYSIS_MIN_FIRE_FRAC,
     ANALYSIS_NUM_FEATURES,
     ANALYSIS_SEED,
     ANALYSIS_TOP_K,
@@ -68,6 +72,63 @@ def _load_sequences(path: Path) -> list[dict]:
         for line in f:
             out.append(json.loads(line))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Candidate filtering and diverse sampling
+# ---------------------------------------------------------------------------
+
+def _filter_candidates(fire_count: np.ndarray, max_per_seq: np.ndarray,
+                        total_tokens: int) -> tuple[np.ndarray, dict]:
+    """Apply (1) the Goldilocks firing-rate band and (2) the minimum
+    distinct-sequence support filter.
+
+    Returns the surviving feature IDs and a small stats dict for logging.
+    """
+    fire_frac = fire_count / max(total_tokens, 1)
+    freq_mask = ((fire_frac >= ANALYSIS_MIN_FIRE_FRAC)
+                  & (fire_frac <= ANALYSIS_MAX_FIRE_FRAC))
+    distinct_seqs = (np.asarray(max_per_seq) > 0).sum(axis=0)
+    seq_mask = distinct_seqs >= ANALYSIS_MIN_DISTINCT_SEQUENCES
+
+    candidates = np.where(freq_mask & seq_mask)[0]
+    stats = {
+        "n_in_band": int(freq_mask.sum()),
+        "n_with_support": int(seq_mask.sum()),
+        "n_candidates": int(candidates.size),
+    }
+    return candidates, stats
+
+
+def _greedy_farthest_point(candidates: np.ndarray,
+                            W_dir: np.ndarray,
+                            n_sample: int,
+                            rng: np.random.Generator) -> np.ndarray:
+    """Pick ``n_sample`` candidates so that their decoder directions have the
+    smallest possible maximum pairwise cosine similarity (greedy farthest
+    point).  Avoids near-duplicate "synonym" features dominating the report.
+
+    ``W_dir`` has shape ``(F, d)`` with unit-norm rows (unit decoder
+    directions); slicing ``W_dir[candidates]`` is therefore a contiguous read.
+    """
+    n_c = int(candidates.size)
+    if n_sample >= n_c:
+        return candidates.copy()
+
+    W_cand = np.asarray(W_dir[candidates], dtype=np.float32)  # (C, d)
+    max_cos = np.full(n_c, -2.0, dtype=np.float32)
+
+    first = int(rng.integers(0, n_c))
+    picked = [first]
+    # Seed max_cos with cosines to the first pick.
+    max_cos = W_cand @ W_cand[first]
+    for _ in range(1, n_sample):
+        max_cos[picked] = 2.0  # exclude already-picked
+        next_idx = int(np.argmin(max_cos))
+        picked.append(next_idx)
+        max_cos = np.maximum(max_cos, W_cand @ W_cand[next_idx])
+
+    return candidates[np.array(picked, dtype=np.int64)]
 
 
 # ---------------------------------------------------------------------------
@@ -289,22 +350,47 @@ def analyse():
               f"but features have {n_seqs} sequences.")
 
     fire_count = np.load(str(FEATURES_DIR / feat_meta["fire_count_file"]))
-    max_per_seq = np.load(str(FEATURES_DIR / feat_meta["max_per_seq_file"]),
-                           mmap_mode="r")
-    argmax_per_seq = np.load(str(FEATURES_DIR / feat_meta["argmax_per_seq_file"]),
-                              mmap_mode="r")
+    # Side arrays are small (~512 MB each) — fully load to RAM.
+    max_per_seq = np.load(str(FEATURES_DIR / feat_meta["max_per_seq_file"]))
+    argmax_per_seq = np.load(str(FEATURES_DIR / feat_meta["argmax_per_seq_file"]))
     n_dead = int((fire_count == 0).sum())
     n_alive = dict_size - n_dead
     print(f"[analyse] Features: {dict_size}, alive: {n_alive}, dead: {n_dead}")
 
-    # ---- Sample non-dead features ----------------------------------------
+    # ---- Filter candidate features ---------------------------------------
+    total_tokens = n_seqs * seq_len
+    candidates, fstats = _filter_candidates(fire_count, max_per_seq, total_tokens)
+    print(f"[analyse] Filters: fire_frac in "
+          f"[{ANALYSIS_MIN_FIRE_FRAC:.0e}, {ANALYSIS_MAX_FIRE_FRAC:.0e}] -> "
+          f"{fstats['n_in_band']:,} features; "
+          f">={ANALYSIS_MIN_DISTINCT_SEQUENCES} distinct seqs -> "
+          f"{fstats['n_with_support']:,} features; "
+          f"candidates (intersection): {fstats['n_candidates']:,}")
+    if candidates.size == 0:
+        raise RuntimeError(
+            "No candidate features survived the filters.  Loosen "
+            "ANALYSIS_MIN_FIRE_FRAC/ANALYSIS_MAX_FIRE_FRAC or "
+            "ANALYSIS_MIN_DISTINCT_SEQUENCES."
+        )
+
+    # ---- Sample features --------------------------------------------------
     rng = np.random.default_rng(ANALYSIS_SEED)
-    alive_ids = np.where(fire_count > 0)[0]
-    if alive_ids.size == 0:
-        raise RuntimeError("No alive features in the test set — nothing to analyse.")
-    n_sample = min(ANALYSIS_NUM_FEATURES, alive_ids.size)
-    sampled_ids = np.sort(rng.choice(alive_ids, size=n_sample, replace=False))
-    print(f"[analyse] Sampling {n_sample} non-dead features for the report.")
+    n_sample = min(ANALYSIS_NUM_FEATURES, int(candidates.size))
+    use_diverse = (ANALYSIS_DIVERSE_SELECTION
+                    and feat_meta.get("decoder_directions_file") is not None)
+    if use_diverse:
+        W_dir = np.load(
+            str(FEATURES_DIR / feat_meta["decoder_directions_file"]),
+            mmap_mode="r",
+        )  # (F, d)
+        sampled_ids = _greedy_farthest_point(candidates, W_dir, n_sample, rng)
+        sel_kind = "diverse (greedy farthest-point on decoder cosine)"
+    else:
+        sampled_ids = rng.choice(candidates, size=n_sample, replace=False)
+        sel_kind = "uniform random over candidates"
+    sampled_ids = np.sort(sampled_ids)
+    print(f"[analyse] Sampling {n_sample} features for the report "
+          f"({sel_kind}).")
 
     # ---- Find top-k sequences for each sampled feature -------------------
     top = _find_top_k(features, sampled_ids,

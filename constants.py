@@ -133,12 +133,31 @@ INFER_FEATURE_BLOCK: int = _env("MONO_INFER_FEATURE_BLOCK", 512, int)
 
 ANALYSIS_DIR: Path = DATA_DIR / "analysis"
 
-# How many non-dead features to randomly sample for the report.
+# How many features to sample for the report.
 ANALYSIS_NUM_FEATURES: int = _env("MONO_ANALYSIS_NUM_FEATURES", 100, int)
 # Number of top-activating sequences to show per feature.
 ANALYSIS_TOP_K: int = _env("MONO_ANALYSIS_TOP_K", 20, int)
 # RNG seed for reproducible feature sampling.
 ANALYSIS_SEED: int = _env("MONO_ANALYSIS_SEED", 0, int)
+
+# Feature-selection filters
+# -------------------------
+# Goldilocks frequency band: drop features whose firing rate on the test set
+# falls outside [min, max] of total tokens.  Too rare → too little evidence
+# to interpret; too common → likely a "boring" ubiquitous direction.
+ANALYSIS_MIN_FIRE_FRAC: float = _env("MONO_ANALYSIS_MIN_FIRE_FRAC", 1e-4, float)
+ANALYSIS_MAX_FIRE_FRAC: float = _env("MONO_ANALYSIS_MAX_FIRE_FRAC", 5e-2, float)
+
+# Minimum number of distinct test sequences a feature must fire in.  Defaults
+# to ANALYSIS_TOP_K so the top-k panel is always fillable from different docs.
+ANALYSIS_MIN_DISTINCT_SEQUENCES: int = _env(
+    "MONO_ANALYSIS_MIN_DISTINCT_SEQUENCES", ANALYSIS_TOP_K, int)
+
+# When True, pick the sampled features by greedy farthest-point selection on
+# decoder cosine similarity (mutually-different decoder directions) instead
+# of uniform random.  Avoids near-duplicate features dominating the report.
+ANALYSIS_DIVERSE_SELECTION: bool = _env(
+    "MONO_ANALYSIS_DIVERSE_SELECTION", True, bool)
 
 # ---------------------------------------------------------------------------
 # LLM-based feature description (analyse.py)
