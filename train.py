@@ -242,6 +242,16 @@ def _lr_lambda(step: int, total_steps: int, decay_frac: float) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Checkpoint discovery / resume
+# ---------------------------------------------------------------------------
+
+def _find_latest_checkpoint() -> Path | None:
+    """Return the highest-numbered checkpoint in CHECKPOINT_DIR, or None."""
+    ckpts = sorted(CHECKPOINT_DIR.glob("sae_step_*.pt"))
+    return ckpts[-1] if ckpts else None
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -296,6 +306,30 @@ def train():
         lr_lambda=lambda step: _lr_lambda(step, NUM_TRAINING_STEPS, LR_DECAY_FRAC),
     )
 
+    # ---- Resume from latest checkpoint (if any) --------------------------
+    start_step = 0
+    latest_ckpt = _find_latest_checkpoint()
+    if latest_ckpt is not None:
+        print(f"[train] Resuming from {latest_ckpt.name}")
+        ckpt = torch.load(str(latest_ckpt), map_location=primary_device,
+                          weights_only=False)
+        if ckpt["d_model"] != d_model or ckpt["dict_size"] != dict_size:
+            raise RuntimeError(
+                f"Checkpoint shape mismatch: ckpt has "
+                f"d_model={ckpt['d_model']}, dict_size={ckpt['dict_size']}; "
+                f"loader has d_model={d_model}, dict_size={dict_size}.  "
+                f"Move/clear {CHECKPOINT_DIR} or fix the config."
+            )
+        sae.load_state_dict(ckpt["model_state_dict"])
+        optimiser.load_state_dict(ckpt["optimiser_state_dict"])
+        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_step = int(ckpt["step"])
+        if start_step >= NUM_TRAINING_STEPS:
+            print(f"[train] Latest checkpoint is already at step "
+                  f"{start_step:,} >= NUM_TRAINING_STEPS={NUM_TRAINING_STEPS:,}.  "
+                  f"Nothing to do.")
+            return
+
     # ---- L1 warmup --------------------------------------------------------
     l1_warmup_steps = int(NUM_TRAINING_STEPS * L1_WARMUP_FRAC)
 
@@ -311,7 +345,9 @@ def train():
     log_l0 = 0.0
     t0 = time.time()
 
-    pbar = tqdm(range(1, NUM_TRAINING_STEPS + 1), desc="training", unit="step")
+    pbar = tqdm(range(start_step + 1, NUM_TRAINING_STEPS + 1),
+                desc="training", unit="step",
+                initial=start_step, total=NUM_TRAINING_STEPS)
     for step in pbar:
         x = loader.get_batch(primary_device)  # (B, d)
 

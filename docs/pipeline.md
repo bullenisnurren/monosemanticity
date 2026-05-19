@@ -55,8 +55,11 @@ Train the SAE on the train-split activations.
 `CHECKPOINT_EVERY` steps. Each checkpoint contains SAE state, optimiser /
 scheduler state, the activation scale, and the training config.
 
-Run: `python train.py`. Resumes naturally from the latest checkpoint via the
-optimiser/scheduler state if rerun.
+Run: `python train.py`. If `data/sae_checkpoints/` already contains a
+checkpoint, training **resumes** from it (model + optimiser + scheduler
+state are all reloaded); if the latest checkpoint is already at
+`NUM_TRAINING_STEPS`, the script exits immediately. To force a fresh run,
+move or clear the checkpoint directory.
 
 ---
 
