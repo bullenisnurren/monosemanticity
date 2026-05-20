@@ -55,8 +55,8 @@ SEQ_LEN: int = _env("MONO_SEQ_LEN", 512, int)
 
 # We extract two disjoint sets of activations: a (large) train set used to
 # fit the SAE and a smaller held-out test set used for inference & analysis.
-NUM_EXTRACT_TOKENS_TRAIN: int = _env("MONO_NUM_EXTRACT_TOKENS_TRAIN", 20_000_000, int)
-NUM_EXTRACT_TOKENS_TEST: int = _env("MONO_NUM_EXTRACT_TOKENS_TEST", 1_000_000, int)
+NUM_EXTRACT_TOKENS_TRAIN: int = _env("MONO_NUM_EXTRACT_TOKENS_TRAIN", 67_108_864, int)
+NUM_EXTRACT_TOKENS_TEST: int = _env("MONO_NUM_EXTRACT_TOKENS_TEST", 2_097_152, int)
 
 ACTIVATIONS_DIR: Path = DATA_DIR / "activations" / _model_slug / f"layer{LAYER_INDEX}"
 ACTIVATIONS_TRAIN_DIR: Path = ACTIVATIONS_DIR / "train"
@@ -72,7 +72,7 @@ EXPANSION_FACTOR: int = _env("MONO_EXPANSION_FACTOR", 64, int)
 # Training hyper-parameters  (paper defaults where applicable)
 # ---------------------------------------------------------------------------
 
-NUM_TRAINING_STEPS: int = _env("MONO_NUM_TRAINING_STEPS", 200_000, int)
+NUM_TRAINING_STEPS: int = _env("MONO_NUM_TRAINING_STEPS", 131_072, int)
 BATCH_SIZE: int = _env("MONO_BATCH_SIZE", 4096, int)
 
 # Activation loader (train.py): we read whole sequences in random order from
@@ -110,6 +110,11 @@ GPU_IDS: list[int] = list(range(NUM_GPUS))
 CHECKPOINT_DIR: Path = DATA_DIR / "sae_checkpoints"
 CHECKPOINT_EVERY: int = _env("MONO_CHECKPOINT_EVERY", 10_000, int)
 LOG_EVERY: int = _env("MONO_LOG_EVERY", 10, int)
+
+# train.py writes one row per LOG_EVERY step to
+# <TRAINING_LOGS_DIR>/training_log.jsonl and re-renders a PNG plot of the
+# training curves at every checkpoint save.
+TRAINING_LOGS_DIR: Path = DATA_DIR / "training_logs"
 
 # ---------------------------------------------------------------------------
 # Inference (infer.py)

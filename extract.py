@@ -100,20 +100,33 @@ def _write_npy_from_raw(raw_path: Path, npy_path: Path,
 # Dataset iteration
 # ---------------------------------------------------------------------------
 
-def _iter_sequences(tokenizer):
-    """Yield successive SEQ_LEN-token sequences as plain Python lists.
+def _iter_sequences(tokenizer, n_special: int):
+    """Yield successive SEQ_LEN-token sequences, each from a single document.
 
-    Documents are tokenised on-the-fly and concatenated into a single stream
-    that is then chopped into fixed-length windows.  No padding, no overlap.
-    The iterator runs forever (or until the dataset is exhausted), so the
-    caller is expected to take only as many sequences as needed.
+    Each yielded sequence has the layout
+        [special-token prefix of length n_special] + [content of length
+         SEQ_LEN - n_special, from a single document]
+    so the model sees a proper context start (BOS etc.) when we run the
+    forward pass.  The downstream pipeline strips the prefix positions
+    from the stored activations / token ids / texts — see
+    ``_extract_split`` — so the SAE never trains on (and the analyser
+    never renders) those degenerate constant-prefix positions.
+
+    Documents whose content is shorter than ``SEQ_LEN - n_special`` tokens
+    are skipped entirely; the trailing content tokens that don't fit a
+    full window are discarded.  No padding, no cross-document content
+    within a sequence.
+
+    The iterator runs until the dataset is exhausted, so the caller is
+    expected to take only as many sequences as needed.
     """
     data_path = DATASET_DIR / "data"
     shard_files = sorted(data_path.glob("shard_*.jsonl"))
     if not shard_files:
         raise FileNotFoundError(f"No shard files in {data_path}. Run download.py first.")
 
-    token_buffer: list[int] = []
+    content_len = SEQ_LEN - n_special
+
     for shard_file in shard_files:
         with open(shard_file) as f:
             for line in f:
@@ -121,10 +134,13 @@ def _iter_sequences(tokenizer):
                 text = row.get(DATASET_TEXT_FIELD, "")
                 if not text:
                     continue
-                token_buffer.extend(tokenizer.encode(text, add_special_tokens=False))
-                while len(token_buffer) >= SEQ_LEN:
-                    yield token_buffer[:SEQ_LEN]
-                    token_buffer = token_buffer[SEQ_LEN:]
+                full = tokenizer.encode(text, add_special_tokens=True)
+                prefix = full[:n_special]
+                content = full[n_special:]
+                n_windows = len(content) // content_len
+                for i in range(n_windows):
+                    chunk = content[i * content_len:(i + 1) * content_len]
+                    yield prefix + chunk  # length SEQ_LEN
 
 
 def _iter_token_batches(seq_iter, max_sequences: int, seqs_per_batch: int):
@@ -164,8 +180,13 @@ def _extract_split(
     target_layer,
     d_model: int,
     seqs_per_batch: int,
+    n_special: int,
 ):
-    """Extract activations for a single split.  Returns (sum_sq_norms, n_tokens, n_seqs)."""
+    """Extract activations for a single split.  Returns ``(sum_sq_norms,
+    n_tokens, n_seqs)``.  ``n_tokens`` counts only the *content* tokens that
+    are actually stored — the ``n_special`` BOS-style prefix positions are
+    fed to the model for context but stripped before writing to disk.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     act_raw = out_dir / "activations.raw"
@@ -174,10 +195,13 @@ def _extract_split(
     act_path = out_dir / "activations.npy"
     tok_path = out_dir / "token_ids.npy"
 
-    n_target_seqs = target_tokens // SEQ_LEN
+    stored_seq_len = SEQ_LEN - n_special  # length of the per-sequence slices we keep
+
+    n_target_seqs = target_tokens // stored_seq_len
     if n_target_seqs == 0:
         raise ValueError(
-            f"[extract] {split_name}: target_tokens={target_tokens} < SEQ_LEN={SEQ_LEN}"
+            f"[extract] {split_name}: target_tokens={target_tokens} < "
+            f"stored_seq_len={stored_seq_len}"
         )
 
     captured: list[torch.Tensor] = []
@@ -192,7 +216,8 @@ def _extract_split(
     total_tokens = 0
     total_seqs = 0
 
-    pbar = tqdm(total=n_target_seqs * SEQ_LEN, desc=f"extract[{split_name}]", unit="tok")
+    pbar = tqdm(total=n_target_seqs * stored_seq_len,
+                desc=f"extract[{split_name}]", unit="tok")
     act_file = open(act_raw, "wb")
     tok_file = open(tok_raw, "wb")
     txt_file = open(txt_path, "w")
@@ -208,24 +233,31 @@ def _extract_split(
             acts = captured[0]  # (B, SEQ_LEN, d_model)  cpu fp32
             B = acts.shape[0]
 
-            # Write activations as raw bytes — same byte layout for both
-            # (B, SEQ_LEN, d) and (B*SEQ_LEN, d), so the .npy header can pick.
-            acts_np = acts.numpy()
+            # Drop the prefix positions: the model needed BOS et al. for an
+            # in-distribution context start, but their activations are
+            # degenerate (same input token every time → near-constant
+            # residual stream) and would just waste SAE capacity.  We keep
+            # only positions [n_special, SEQ_LEN) here, and the rest of the
+            # pipeline (train/infer/analyse) sees pure content positions.
+            acts_content = acts[:, n_special:, :].contiguous()
+            tok_content = batch_ids[:, n_special:].contiguous()
+
+            acts_np = acts_content.numpy()
             act_file.write(acts_np.tobytes())
             sum_sq_norms += float((acts_np ** 2).sum())
 
-            tok_np = batch_ids.numpy().astype(np.int32)
+            tok_np = tok_content.numpy().astype(np.int32)
             tok_file.write(tok_np.tobytes())
 
             for seq_idx in range(B):
-                ids = batch_ids[seq_idx].tolist()
+                ids = tok_content[seq_idx].tolist()
                 text = tokenizer.decode(ids, skip_special_tokens=False)
                 tokens = [tokenizer.decode([tid]) for tid in ids]
                 txt_file.write(json.dumps({"text": text, "tokens": tokens}) + "\n")
 
             total_seqs += B
-            total_tokens += B * SEQ_LEN
-            pbar.update(B * SEQ_LEN)
+            total_tokens += B * stored_seq_len
+            pbar.update(B * stored_seq_len)
 
             if total_seqs >= n_target_seqs:
                 break
@@ -237,13 +269,27 @@ def _extract_split(
         txt_file.close()
 
     print(f"[extract] {split_name}: collected {total_seqs:,} sequences "
-          f"({total_tokens:,} tokens)")
+          f"({total_tokens:,} content tokens, stored_seq_len={stored_seq_len})")
 
-    # Convert the raw streams to .npy with their final 3D / 2D shapes.
+    # If the dataset stream / iterator ran out before we filled the budget
+    # for this split, save whatever we did get and warn.  Downstream
+    # scripts will just operate on the smaller corpus.
+    if total_seqs < n_target_seqs:
+        shortfall = n_target_seqs - total_seqs
+        print(f"[extract] WARNING: {split_name} budget not met — "
+              f"got {total_seqs:,}/{n_target_seqs:,} sequences "
+              f"({shortfall:,} short, ~{shortfall * stored_seq_len:,} tokens "
+              f"missing).  Dataset was exhausted or had too few "
+              f"long-enough documents.")
+
+    # Convert the raw streams to .npy with their final 3D / 2D shapes —
+    # note the stored seq-length axis is SEQ_LEN - n_special, not SEQ_LEN.
     _write_npy_from_raw(act_raw, act_path,
-                        np.dtype(np.float32), (total_seqs, SEQ_LEN, d_model))
+                        np.dtype(np.float32),
+                        (total_seqs, stored_seq_len, d_model))
     _write_npy_from_raw(tok_raw, tok_path,
-                        np.dtype(np.int32), (total_seqs, SEQ_LEN))
+                        np.dtype(np.int32),
+                        (total_seqs, stored_seq_len))
 
     return sum_sq_norms, total_tokens, total_seqs
 
@@ -288,24 +334,59 @@ def extract_activations():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # We call tokenizer.encode() on entire dataset documents, some of which
+    # tokenise to >model_max_length tokens (Llama-3.2 has a 131k context).
+    # HuggingFace warns "Token indices sequence length is longer than the
+    # specified maximum sequence length …" preemptively, but we chop the
+    # encoded stream into SEQ_LEN-token windows before any forward pass, so
+    # the warning is harmless.  Disable the length check to silence it.
+    tokenizer.model_max_length = int(1e18)
+
+    # Figure out how many special tokens the tokenizer prepends by default
+    # (BOS for Llama-3.2, etc.).  We feed them to the model so the residual
+    # stream at content positions is in-distribution, then strip them from
+    # the stored activations / token ids / texts so the SAE never sees the
+    # degenerate prefix positions (their residual stream is essentially
+    # constant across all sequences and would just waste dictionary
+    # capacity on a "BOS detector" feature).
+    _with = tokenizer.encode("test", add_special_tokens=True)
+    _without = tokenizer.encode("test", add_special_tokens=False)
+    n_special = len(_with) - len(_without)
+    if n_special < 0 or _with[n_special:] != _without:
+        raise RuntimeError(
+            f"Tokenizer adds non-prefix special tokens "
+            f"(with={_with}, without={_without}); this pipeline only "
+            f"supports tokenizers that prepend special tokens at the start."
+        )
+    if n_special >= SEQ_LEN:
+        raise RuntimeError(
+            f"n_special ({n_special}) >= SEQ_LEN ({SEQ_LEN}); nothing left "
+            f"for content."
+        )
+    print(f"[extract] Tokenizer prepends {n_special} special token(s) per "
+          f"sequence (stored seq_len = SEQ_LEN - {n_special} = "
+          f"{SEQ_LEN - n_special}).")
+
     target_layer = model.model.layers[LAYER_INDEX]
 
     # 4 sequences per batch keeps batch_tokens ≈ 2k as in the original code.
     seqs_per_batch = max(1, 2048 // SEQ_LEN)
 
     # Single shared iterator → train and test draw disjoint sequences.
-    seq_iter = _iter_sequences(tokenizer)
+    seq_iter = _iter_sequences(tokenizer, n_special)
 
     # ---- Train split ------------------------------------------------------
     train_sum_sq, train_tok, train_seqs = _extract_split(
         "train", ACTIVATIONS_TRAIN_DIR, NUM_EXTRACT_TOKENS_TRAIN,
         seq_iter, model, tokenizer, target_layer, d_model, seqs_per_batch,
+        n_special,
     )
 
     # ---- Test split (continues from where train left off) ----------------
     test_sum_sq, test_tok, test_seqs = _extract_split(
         "test", ACTIVATIONS_TEST_DIR, NUM_EXTRACT_TOKENS_TEST,
         seq_iter, model, tokenizer, target_layer, d_model, seqs_per_batch,
+        n_special,
     )
 
     # ---- Free model -------------------------------------------------------
@@ -313,17 +394,30 @@ def extract_activations():
     torch.cuda.empty_cache()
 
     # ---- Compute global normalisation scalar (from TRAIN only) ------------
+    if train_tok == 0:
+        raise RuntimeError(
+            "[extract] Train split has zero stored tokens — the dataset is "
+            "empty or every document tokenises to fewer than "
+            f"{SEQ_LEN - n_special} content tokens.  Cannot compute the "
+            "normalisation scalar.  Increase the dataset size, reduce "
+            "MONO_SEQ_LEN, or pick a dataset with longer documents."
+        )
     mean_sq_norm = train_sum_sq / train_tok
     scale = math.sqrt(d_model / mean_sq_norm)
     print(f"[extract] Normalisation scale = {scale:.6f}  "
           f"(train mean ||x||^2 = {mean_sq_norm:.1f}, target = {d_model})")
 
     # ---- Write metadata ---------------------------------------------------
+    # NOTE: seq_len here is the *stored* sequence length, i.e. content only
+    # (= SEQ_LEN - n_prefix_tokens).  model_seq_len records what the model
+    # actually saw during the forward pass, prefix included.
     common = {
         "model_name": MODEL_NAME,
         "layer_index": LAYER_INDEX,
         "d_model": d_model,
-        "seq_len": SEQ_LEN,
+        "seq_len": SEQ_LEN - n_special,
+        "model_seq_len": SEQ_LEN,
+        "n_prefix_tokens": n_special,
         "scale": scale,
         "act_file": "activations.npy",
         "token_ids_file": "token_ids.npy",

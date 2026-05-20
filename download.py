@@ -119,6 +119,16 @@ def download_dataset() -> Path:
         _flush_shard(buffer, data_path, shard_idx)
         total_saved += len(buffer)
 
+    # If the dataset stream ran out before we hit our target, save whatever
+    # we got and warn loudly; the user can decide whether the smaller
+    # corpus is acceptable.  extract.py will issue a second warning if the
+    # token budget can't be filled either.
+    if total_saved < n_examples:
+        print(f"[download] WARNING: dataset exhausted after {total_saved:,} "
+              f"examples (target was ~{n_examples:,}).  Proceeding with what "
+              f"we have — extract.py may not be able to fill the requested "
+              f"train/test token budgets.")
+
     meta = {
         "dataset_name": DATASET_NAME,
         "split": DATASET_SPLIT,

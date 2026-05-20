@@ -33,11 +33,18 @@ from a single sweep over the data (disjoint sequences).
 **Inputs**: outputs of `download.py`.
 
 **Outputs (per split)** under `data/activations/<model>/layer<N>/<split>/`:
-- `activations.npy` — `(n_seqs, SEQ_LEN, d_model)` fp32, raw (unnormalised).
-- `token_ids.npy` — `(n_seqs, SEQ_LEN)` int32.
-- `sequences.jsonl` — one `{"text": ..., "tokens": [...]}` per sequence.
+- `activations.npy` — `(n_seqs, stored_seq_len, d_model)` fp32, raw
+  (unnormalised). Each sequence's content comes from a single document, with
+  `SEQ_LEN - n_prefix_tokens` content positions stored; the tokenizer's
+  special-token prefix (e.g. BOS for Llama-3.2) is fed to the model for
+  context but stripped from disk.
+- `token_ids.npy` — `(n_seqs, stored_seq_len)` int32, content tokens only.
+- `sequences.jsonl` — one `{"text": ..., "tokens": [...]}` per sequence
+  (content only).
 - `meta.json` — split metadata, including the global normalisation scalar
-  `scale` (computed from the train split).
+  `scale` (computed from the train split), the stored `seq_len`, the
+  `model_seq_len` (the input length used for the forward pass) and
+  `n_prefix_tokens`.
 
 **Skips if**: both `train/meta.json` and `test/meta.json` exist.
 

@@ -16,12 +16,16 @@ Key training details:
     Instead, the L1 term is weighted by the decoder column norms.
 """
 
+import datetime as _dt
 import json
 import warnings
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402  (set backend first)
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,7 +50,12 @@ from constants import (
     CHECKPOINT_DIR,
     CHECKPOINT_EVERY,
     LOG_EVERY,
+    TRAINING_LOGS_DIR,
 )
+
+# Files inside TRAINING_LOGS_DIR.
+_TRAINING_LOG_FILE = "training_log.jsonl"
+_TRAINING_PLOT_FILE = "training_curves.png"
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +261,107 @@ def _find_latest_checkpoint() -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Continuous logging + plotting
+# ---------------------------------------------------------------------------
+
+def _open_log_file(start_step: int) -> Path:
+    """Decide what to do with the training log file and return its path.
+
+    - Fresh run (``start_step == 0``) with an existing log → rotate it to a
+      timestamped backup so we never overwrite previous history.
+    - Resume with an existing log → append to it.
+    - Resume with no log → warn and start a fresh log from ``start_step``
+      (we can't reconstruct earlier history).
+    """
+    TRAINING_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = TRAINING_LOGS_DIR / _TRAINING_LOG_FILE
+
+    if start_step == 0 and log_path.exists():
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = log_path.with_name(f"training_log.{ts}.jsonl")
+        log_path.rename(backup)
+        print(f"[train] Starting fresh; rotated previous log -> {backup.name}")
+    elif start_step > 0 and not log_path.exists():
+        print(f"[train] WARNING: resuming from step {start_step:,} but no "
+              f"training log at {log_path}; starting a fresh log "
+              "(earlier history cannot be reconstructed).")
+
+    return log_path
+
+
+def _read_log(log_path: Path) -> list[dict]:
+    """Read the full jsonl log file into a list of dicts (skip bad lines)."""
+    rows: list[dict] = []
+    if not log_path.exists():
+        return rows
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # tolerate a half-written final line
+    return rows
+
+
+def _plot_training_curves(log_path: Path, plot_path: Path) -> None:
+    """Render a 2×2 panel of training curves from the log file."""
+    rows = _read_log(log_path)
+    if not rows:
+        return
+    rows.sort(key=lambda r: r["step"])
+    steps = np.array([r["step"] for r in rows], dtype=np.int64)
+
+    def _col(name):
+        return np.array([r.get(name, np.nan) for r in rows], dtype=np.float64)
+
+    loss = _col("loss")
+    mse = _col("mse")
+    l1 = _col("l1")
+    l0 = _col("l0")
+    lr = _col("lr")
+    l1c = _col("l1_coeff")
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    ax = axes[0, 0]
+    ax.plot(steps, loss, label="total loss", color="C0")
+    ax.plot(steps, mse, label="MSE", color="C1")
+    ax.set_ylabel("loss")
+    ax.set_yscale("log")
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(alpha=0.3)
+
+    ax = axes[0, 1]
+    ax.plot(steps, l1, color="C2")
+    ax.set_ylabel("weighted L1  ($\\Sigma_i f_i \\| w_{dec,i} \\|$)")
+    ax.grid(alpha=0.3)
+
+    ax = axes[1, 0]
+    ax.plot(steps, l0, color="C3")
+    ax.set_ylabel("L0 (active features / token)")
+    ax.set_xlabel("step")
+    ax.grid(alpha=0.3)
+
+    ax = axes[1, 1]
+    ax2 = ax.twinx()
+    ax.plot(steps, lr, color="C4", label="learning rate")
+    ax2.plot(steps, l1c, color="C5", linestyle="--", label="L1 coeff")
+    ax.set_ylabel("learning rate", color="C4")
+    ax2.set_ylabel("L1 coefficient", color="C5")
+    ax.set_xlabel("step")
+    ax.grid(alpha=0.3)
+
+    fig.suptitle("SAE training curves")
+    fig.tight_layout()
+    tmp = plot_path.with_suffix(".png.tmp")
+    fig.savefig(tmp, dpi=100, format="png")
+    plt.close(fig)
+    tmp.replace(plot_path)
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -338,6 +448,12 @@ def train():
             return L1_COEFF
         return L1_COEFF * min(1.0, step / l1_warmup_steps)
 
+    # ---- Logging setup ----------------------------------------------------
+    log_path = _open_log_file(start_step)
+    plot_path = TRAINING_LOGS_DIR / _TRAINING_PLOT_FILE
+    log_fh = open(log_path, "a")
+    print(f"[train] Logging metrics to {log_path}")
+
     # ---- Training ---------------------------------------------------------
     log_mse = 0.0
     log_l1 = 0.0
@@ -348,45 +464,64 @@ def train():
     pbar = tqdm(range(start_step + 1, NUM_TRAINING_STEPS + 1),
                 desc="training", unit="step",
                 initial=start_step, total=NUM_TRAINING_STEPS)
-    for step in pbar:
-        x = loader.get_batch(primary_device)  # (B, d)
+    try:
+        for step in pbar:
+            x = loader.get_batch(primary_device)  # (B, d)
 
-        l1_coeff = _current_l1(step)
-        # Forward pass.  DataParallel splits x across GPUs; each replica
-        # computes its own per-shard loss.  DP gathers the scalar outputs
-        # into a 1-D tensor (one element per GPU), so we .mean() before
-        # calling backward.
-        loss, mse, l1, l0 = model(x, l1_coeff)
-        loss = loss.mean()
+            l1_coeff = _current_l1(step)
+            # Forward pass.  DataParallel splits x across GPUs; each replica
+            # computes its own per-shard loss.  DP gathers the scalar outputs
+            # into a 1-D tensor (one element per GPU), so we .mean() before
+            # calling backward.
+            loss, mse, l1, l0 = model(x, l1_coeff)
+            loss = loss.mean()
 
-        optimiser.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(sae.parameters(), GRAD_CLIP_NORM)
-        optimiser.step()
-        scheduler.step()
+            optimiser.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(sae.parameters(), GRAD_CLIP_NORM)
+            optimiser.step()
+            scheduler.step()
 
-        # ---- Logging bookkeeping -----------------------------------------
-        log_loss += loss.item()
-        log_mse += mse.mean().item()
-        log_l1 += l1.mean().item()
-        log_l0 += l0.mean().item()
+            # ---- Logging bookkeeping ---------------------------------------
+            log_loss += loss.item()
+            log_mse += mse.mean().item()
+            log_l1 += l1.mean().item()
+            log_l0 += l0.mean().item()
 
-        if step % LOG_EVERY == 0:
-            n = LOG_EVERY
-            # Explained variance over last log window (approximated from
-            # running averages -- exact EV is computed in analyse.py).
-            current_lr = scheduler.get_last_lr()[0]
-            pbar.set_postfix_str(
-                f"loss={log_loss/n:.4f}  mse={log_mse/n:.4f}  "
-                f"l1={log_l1/n:.4f}  L0={log_l0/n:.1f}  "
-                f"l1c={l1_coeff:.3f}  lr={current_lr:.2e}"
-            )
-            log_loss = log_mse = log_l1 = log_l0 = 0.0
+            if step % LOG_EVERY == 0:
+                n = LOG_EVERY
+                avg_loss = log_loss / n
+                avg_mse = log_mse / n
+                avg_l1 = log_l1 / n
+                avg_l0 = log_l0 / n
+                current_lr = scheduler.get_last_lr()[0]
+                pbar.set_postfix_str(
+                    f"loss={avg_loss:.4f}  mse={avg_mse:.4f}  "
+                    f"l1={avg_l1:.4f}  L0={avg_l0:.1f}  "
+                    f"l1c={l1_coeff:.3f}  lr={current_lr:.2e}"
+                )
+                row = {
+                    "step": int(step),
+                    "loss": avg_loss,
+                    "mse": avg_mse,
+                    "l1": avg_l1,
+                    "l0": avg_l0,
+                    "l1_coeff": float(l1_coeff),
+                    "lr": float(current_lr),
+                    "elapsed_s": time.time() - t0,
+                }
+                log_fh.write(json.dumps(row) + "\n")
+                log_fh.flush()
+                log_loss = log_mse = log_l1 = log_l0 = 0.0
 
-        # ---- Checkpoint ---------------------------------------------------
-        if step % CHECKPOINT_EVERY == 0 or step == NUM_TRAINING_STEPS:
-            _save_checkpoint(sae, optimiser, scheduler, step,
-                             d_model, dict_size, loader.scale)
+            # ---- Checkpoint -----------------------------------------------
+            if step % CHECKPOINT_EVERY == 0 or step == NUM_TRAINING_STEPS:
+                _save_checkpoint(sae, optimiser, scheduler, step,
+                                 d_model, dict_size, loader.scale)
+                log_fh.flush()
+                _plot_training_curves(log_path, plot_path)
+    finally:
+        log_fh.close()
 
     elapsed = time.time() - t0
     print(f"[train] Finished {NUM_TRAINING_STEPS} steps in {elapsed:.1f}s "

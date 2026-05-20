@@ -23,13 +23,29 @@ Untouched HuggingFace snapshot: `config.json`, `tokenizer*.json`,
 
 ## `data/activations/<model_slug>/layer<N>/{train,test}/`
 
+### Sequence construction
+
+The model forward pass uses sequences of length `MONO_SEQ_LEN`. Each is laid
+out as `[special-token prefix from the tokenizer (e.g. BOS for Llama-3.2)]
++ [content tokens from a single source document]`. The prefix positions are
+*stripped* before anything is written to disk — they're degenerate (same
+input token every time, so near-constant residual stream) and we don't want
+the SAE to waste capacity learning a "BOS detector" feature.
+
+Resulting stored sequence length is `stored_seq_len = MONO_SEQ_LEN -
+n_prefix_tokens` (= 511 with default Llama-3.2 settings, where the tokenizer
+prepends just BOS). Documents whose content tokenises to fewer than
+`stored_seq_len` tokens are dropped entirely; the trailing content beyond
+`floor(len/stored_seq_len) · stored_seq_len` is discarded. No padding.
+
 ### `activations.npy`
-Shape `(num_sequences, SEQ_LEN, d_model)`, fp32, C-major. **Raw** residual
-activations (no normalisation applied). Apply `× scale` (from `meta.json`)
-to get the values the SAE expects.
+Shape `(num_sequences, stored_seq_len, d_model)`, fp32, C-major. **Raw**
+residual activations (no normalisation applied). Apply `× scale` (from
+`meta.json`) to get the values the SAE expects.
 
 ### `token_ids.npy`
-Shape `(num_sequences, SEQ_LEN)`, int32. HF tokenizer IDs.
+Shape `(num_sequences, stored_seq_len)`, int32. HF tokenizer IDs of the
+content tokens — the prefix tokens (BOS etc.) are not stored.
 
 ### `sequences.jsonl`
 One JSON per sequence: `{"text": "<decoded>", "tokens": ["<tok0>", ...]}`.
@@ -42,18 +58,20 @@ Per-token strings are precomputed so analyse.py doesn't need a tokenizer.
   "model_name": "meta-llama/Llama-3.2-1B",
   "layer_index": 8,
   "d_model": 2048,
-  "seq_len": 512,
-  "scale": 1.291...,                // sqrt(d_model / E[‖x‖²]) computed on train
+  "seq_len": 511,                    // stored content length (no prefix)
+  "model_seq_len": 512,              // MONO_SEQ_LEN — what the model saw
+  "n_prefix_tokens": 1,              // tokenizer-prepended specials (BOS)
+  "scale": 1.291...,                 // sqrt(d_model / E[‖x‖²]) over train
   "act_file": "activations.npy",
   "token_ids_file": "token_ids.npy",
   "sequences_file": "sequences.jsonl",
-  "split": "train",                 // or "test"
+  "split": "train",                  // or "test"
   "num_sequences": 39062,
-  "num_tokens": 19999744
+  "num_tokens": 19960682             // total content tokens stored
 }
 ```
 
-`scale` is identical in both splits.
+`scale`, `model_seq_len`, and `n_prefix_tokens` are identical in both splits.
 
 ---
 
@@ -84,8 +102,10 @@ Per-token strings are precomputed so analyse.py doesn't need a tokenizer.
 ## `data/features/<model_slug>/layer<N>/`
 
 ### `features.npy`
-Shape `(dict_size, num_test_sequences, seq_len)`, fp16, C-major
+Shape `(dict_size, num_test_sequences, stored_seq_len)`, fp16, C-major
 (feature-major layout). Values are decoder-norm-scaled: `f_i · ‖w_dec_i‖`.
+`stored_seq_len` is the *content* length inherited from the test
+activations (i.e. `MONO_SEQ_LEN - n_prefix_tokens`).
 
 ### `fire_count.npy`
 Shape `(dict_size,)`, int64. Number of test tokens each feature fires on.
@@ -116,11 +136,11 @@ Verbatim copies of the test-split equivalents.
   "dict_size": 131072,
   "expansion_factor": 64,
   "num_sequences": 1953,
-  "seq_len": 512,
+  "seq_len": 511,                           // stored content length
   "feature_dtype": "float16",
   "feature_decoder_scaled": true,
   "features_layout": "feature_major",
-  "features_shape": [131072, 1953, 512],
+  "features_shape": [131072, 1953, 511],
   "features_file": "features.npy",
   "fire_count_file": "fire_count.npy",
   "max_per_seq_file": "max_per_seq.npy",
