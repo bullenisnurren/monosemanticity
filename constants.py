@@ -146,7 +146,7 @@ ANALYSIS_DIR: Path = DATA_DIR / "analysis"
 # How many features to sample for the report.
 ANALYSIS_NUM_FEATURES: int = _env("MONO_ANALYSIS_NUM_FEATURES", 100, int)
 # Number of top-activating sequences to show per feature.
-ANALYSIS_TOP_K: int = _env("MONO_ANALYSIS_TOP_K", 20, int)
+ANALYSIS_TOP_K: int = _env("MONO_ANALYSIS_TOP_K", 10, int)
 # RNG seed for reproducible feature sampling.
 ANALYSIS_SEED: int = _env("MONO_ANALYSIS_SEED", 0, int)
 
