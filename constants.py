@@ -132,6 +132,11 @@ FEATURE_DTYPE: str = _env("MONO_FEATURE_DTYPE", "float16")
 # per feature group).  Larger = fewer disk seeks but more GPU memory.
 INFER_FEATURE_BLOCK: int = _env("MONO_INFER_FEATURE_BLOCK", 512, int)
 
+# Within each feature block, infer.py streams the test activations in chunks
+# of this many sequences (NOT tokens) from the on-disk memmap to the GPU.
+# Bounds GPU memory regardless of the test-set size.
+INFER_CHUNK_SEQUENCES: int = _env("MONO_INFER_CHUNK_SEQUENCES", 64, int)
+
 # ---------------------------------------------------------------------------
 # Analysis (analyse.py)
 # ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ from constants import (
     CHECKPOINT_DIR,
     FEATURES_DIR,
     FEATURE_DTYPE,
+    INFER_CHUNK_SEQUENCES,
     INFER_FEATURE_BLOCK,
 )
 from train import SparseAutoencoder
@@ -114,7 +115,7 @@ def infer():
     # precision is more than enough for interpretability work.
     sae = sae.to(torch.bfloat16)
 
-    # ---- Load test activations -------------------------------------------
+    # ---- Locate test activations -----------------------------------------
     test_meta_path = ACTIVATIONS_TEST_DIR / "meta.json"
     if not test_meta_path.exists():
         raise FileNotFoundError(
@@ -133,20 +134,9 @@ def infer():
             f"d_model mismatch: activations={d_model} vs SAE={sae.d_model}"
         )
 
-    # Pull activations into a bf16 GPU buffer in CPU-side chunks so we never
-    # allocate the full fp32 tensor on the GPU (default settings: 4 GB bf16
-    # vs 8 GB fp32).  The scale is applied on the CPU side.
-    print(f"[infer] Loading {n_seqs * seq_len * d_model * 2 / 1e9:.2f} GB of "
-          f"test activations to GPU (bf16) ...")
-    x = torch.empty((n_seqs, seq_len, d_model),
-                     dtype=torch.bfloat16, device=device)
-    load_chunk = 256
-    for i in range(0, n_seqs, load_chunk):
-        end = min(i + load_chunk, n_seqs)
-        cpu = torch.from_numpy(np.array(test_acts_mm[i:end], dtype=np.float32))
-        cpu *= activation_scale
-        x[i:end] = cpu.to(torch.bfloat16)
-    del test_acts_mm
+    print(f"[infer] Test activations: {n_seqs:,} sequences × {seq_len} tokens "
+          f"× {d_model} dims ({n_seqs * seq_len * d_model * 4 / 1e9:.2f} GB "
+          f"on disk, streaming).")
 
     # ---- Allocate output memmap (feature-major) --------------------------
     feat_dtype = np.dtype(FEATURE_DTYPE)
@@ -169,35 +159,75 @@ def infer():
     if seq_len > 32767:
         raise ValueError("argmax_per_seq uses int16; seq_len must be <= 32767.")
 
-    # ---- Feature-block sweep ---------------------------------------------
+    # ---- Feature-block × sequence-chunk sweep ----------------------------
+    #
+    # For each feature block we walk the test set in chunks of
+    # INFER_CHUNK_SEQUENCES sequences, building the block's features in a
+    # CPU buffer one chunk at a time, then writing the whole block to the
+    # memmap in one contiguous slab.  This keeps GPU memory O(chunk · S · d)
+    # — independent of the test-set size — while preserving sequential disk
+    # writes (one F-block per iteration, exactly as before).
+    #
+    # The test activations are read from a memmap, so on the first F-block
+    # iteration the OS fills its page cache from disk and every subsequent
+    # F-block reuses those cached pages for free.  Default settings give
+    # ~17 GB of test activations, which sits comfortably in cache.
     f_block = max(1, INFER_FEATURE_BLOCK)
+    s_chunk = max(1, INFER_CHUNK_SEQUENCES)
     n_blocks = (dict_size + f_block - 1) // f_block
+    n_chunks = (n_seqs + s_chunk - 1) // s_chunk
+    print(f"[infer] {n_blocks} feature blocks × {n_chunks} sequence chunks "
+          f"(F_BLOCK={f_block}, CHUNK_SEQS={s_chunk}).")
 
     for bi in tqdm(range(n_blocks), desc="infer", unit="block"):
         f_start = bi * f_block
         f_end = min(f_start + f_block, dict_size)
+        size = f_end - f_start
 
         with torch.no_grad():
-            W_block = sae.W_enc[f_start:f_end]                          # (B, d) bf16
-            b_block = b_enc_eff[f_start:f_end].to(torch.bfloat16)        # (B,)
-            d_block = dec_norms[f_start:f_end].to(torch.bfloat16)        # (B,)
+            W_block = sae.W_enc[f_start:f_end]                       # (B, d) bf16
+            b_block = b_enc_eff[f_start:f_end].to(torch.bfloat16)     # (B,)
+            d_block = dec_norms[f_start:f_end].to(torch.bfloat16)     # (B,)
 
-            f_3d = torch.relu(x @ W_block.T + b_block)                   # (N, S, B) bf16
-            f_3d.mul_(d_block)
+        # CPU staging buffer for this F-block's output.  Written once at
+        # the end as a single contiguous slab into the memmap.
+        f_buf = np.empty((size, n_seqs, seq_len), dtype=feat_dtype)
 
-            fire_count[f_start:f_end] = (f_3d > 0).sum(dim=(0, 1)).cpu().numpy()
-            max_vals, max_idxs = f_3d.max(dim=1)                         # (N, B)
-            max_per_seq[:, f_start:f_end] = max_vals.to(torch.float16).cpu().numpy()
-            argmax_per_seq[:, f_start:f_end] = max_idxs.to(torch.int16).cpu().numpy()
+        for c_start in range(0, n_seqs, s_chunk):
+            c_end = min(c_start + s_chunk, n_seqs)
 
-            # (N, S, B) -> (B, N, S), contiguous in fp16 for the write.
-            f_out = (
-                f_3d.permute(2, 0, 1).to(torch.float16).contiguous().cpu().numpy()
-            )
-            del f_3d
+            # CPU-side: read chunk from memmap (fp32), apply activation
+            # scale, cast to bf16, then push to GPU.
+            x_cpu = np.array(test_acts_mm[c_start:c_end], dtype=np.float32)
+            x_cpu *= activation_scale
+            x = torch.from_numpy(x_cpu).to(device, dtype=torch.bfloat16,
+                                            non_blocking=True)
 
-        features[f_start:f_end] = f_out
-        del f_out
+            with torch.no_grad():
+                f_3d = torch.relu(x @ W_block.T + b_block)            # (chunk, S, B)
+                f_3d.mul_(d_block)
+
+                # Per-chunk × per-block contributions to the side arrays.
+                fc_chunk = (f_3d > 0).sum(dim=(0, 1)).cpu().numpy()
+                fire_count[f_start:f_end] += fc_chunk
+                max_vals, max_idxs = f_3d.max(dim=1)                  # (chunk, B)
+                max_per_seq[c_start:c_end, f_start:f_end] = (
+                    max_vals.to(torch.float16).cpu().numpy())
+                argmax_per_seq[c_start:c_end, f_start:f_end] = (
+                    max_idxs.to(torch.int16).cpu().numpy())
+
+                # (chunk, S, B) -> (B, chunk, S), fp16, contiguous for the
+                # CPU buffer slice we're about to fill.
+                f_out = (f_3d.permute(2, 0, 1).to(torch.float16)
+                              .contiguous().cpu().numpy())
+                del f_3d
+
+            f_buf[:, c_start:c_end, :] = f_out
+            del f_out, x, x_cpu
+
+        # One contiguous write of the entire F-block.
+        features[f_start:f_end] = f_buf
+        del f_buf
 
     features.flush()
 
